@@ -1,0 +1,461 @@
+/*
+* (C) Copyright 2013 Lauro Ojeda
+*
+* <lvojeda@gmail.com>
+*
+* Robot drawing system using the Lego NXT
+*
+* This program is free software; you can redistribute it and/or
+* modify it under the terms of the GNU General Public License as
+* published by the Free Software Foundation; either version 3 of
+* the License, or (at your option) any later version.
+*
+* This program is distributed in the hope that it will be useful,
+* but WITHOUT ANY WARRANTY; without even the implied warranty of
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+* GNU General Public License for more details.
+*
+* You should have received a copy of the GNU General Public License
+* along with this program; if not, write to the Free Software Foundation,
+* Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
+*/
+
+#define FILENAME "drawing.log"
+#define FILESIZE 1000
+
+//Platform specific constants
+#define ENCODER_SF 0.38 //[mm/cnt]
+#define WHEELBASE 120 //[mm]
+
+//XG1300L constants
+#define XG1300L_PORT S1
+#define XG1300L_ADDR 0x02
+#define XG1300L_ANG_REG 0x42
+#define XG1300L_RESET_REG 0x60
+#define XG1300L_PACKET 2
+#define XG1300L_CMD 2
+
+//Port settings
+#define LEFT_MOTOR OUT_C
+#define RIGHT_MOTOR OUT_A
+#define MARKER_MOTOR OUT_B
+
+//Control parms
+//PID parameters
+#define MAX_SPEED 25*ENCODER_SF //[cnt/sec] = [mm/sec]*[mm/cnt]
+#define MIN_TARGET_DIST 5 //[mm]
+#define MIN_TARGET_ANG 1*PI/180 //[deg]
+#define MIN_RATE 4
+#define MAX_RATE 10
+#define RATE_SF 25
+#define MARKER_ANGLE 5
+#define MARKER_POWER 8
+
+//Display constants
+#define COL1 17
+#define COL2 42
+#define COL3 67
+#define COL4 82
+
+#define SCALE_FACTOR .6
+#define USE_BINARY 0
+
+enum {LOADING_HEADER,LOADING_WAYPOINTS,TURNING,STEERING,MOVING,QUITTING};
+enum {GOING_DOWN,GOING_UP,DOWN,UP};
+
+struct Motor
+{
+	char left;
+	char right;
+	float rel_ang;
+	float rel_dist;
+	float speed;
+	float rate;
+};
+
+struct Waypoint
+{
+	unsigned short x;
+	unsigned short y;
+};
+
+struct Pos 
+{
+	float x;
+	float y;
+	float ang;
+	float dist;
+};
+
+//Global variables
+//Image file
+byte g_file_handle;
+//Encoder and motor information
+int g_last_left_cnt;
+int g_last_right_cnt;
+float g_last_rel_dist;
+float g_last_ang;
+//Waipoints
+Waypoint g_last_waypoint;
+
+float unwrap(float x)
+{
+	if(x<-PI)
+		x+=2.0*PI;
+	else if(x>=PI)
+		x-=2.0*PI;
+	return x;
+}
+//Reset XG1300L sensor
+void XglReset()
+{
+	byte cmd[XG1300L_CMD];
+	byte n_read = 0;
+	ArrayBuild(cmd,XG1300L_ADDR, XG1300L_RESET_REG);
+	while (I2CStatus(XG1300L_PORT, n_read) == STAT_COMM_PENDING);
+	I2CWrite(XG1300L_PORT,0,cmd);
+}
+
+//Read angle values
+short XglReadAngle()
+{
+	byte data[XG1300L_PACKET];
+	byte cmd[XG1300L_CMD];
+	byte count = XG1300L_PACKET;
+	byte n_read = 0;
+	short ang = 0;
+	ArrayBuild(cmd,XG1300L_ADDR, XG1300L_ANG_REG);
+	while (I2CStatus(XG1300L_PORT, n_read) == STAT_COMM_PENDING);
+	if (I2CBytes(XG1300L_PORT, cmd, count, data))
+		ang = (data[0] + data[1]*256); //Assemble data
+	return -ang;
+}
+
+void estimate_position(Pos &pos)
+{
+	//Get encoder information
+  int right_cnt = MotorRotationCount(RIGHT_MOTOR);
+  int left_cnt = MotorRotationCount(LEFT_MOTOR);
+	//Estimate linear displacement
+	pos.dist = ((right_cnt-g_last_right_cnt)+(left_cnt-g_last_left_cnt))/2*ENCODER_SF;
+	//Get gyro data and convert it to radians
+	g_last_ang = pos.ang;
+	pos.ang = XglReadAngle()/100*PI/180.0;
+	//Compute position
+	pos.x += pos.dist*cos(pos.ang);
+	pos.y += pos.dist*sin(pos.ang);
+	g_last_right_cnt = right_cnt;
+	g_last_left_cnt = left_cnt;
+}
+
+// Open the Waypoint data file for reading
+void open_for_read()
+{
+	unsigned int rtn_code;
+	unsigned int size = FILESIZE;
+	rtn_code = OpenFileRead(FILENAME, size, g_file_handle);
+	// Return code handling 
+	if(rtn_code != LDR_SUCCESS)
+	{
+		// Unanticipated exception. 
+		TextOut(0, LCD_LINE1, "File not found ");
+		NumOut(0,LCD_LINE2,rtn_code);
+		while(1);
+	}
+}
+
+unsigned short read_number()
+{
+	unsigned char single_byte; 
+	unsigned short value = 0; 
+	if(USE_BINARY)
+	{
+		Read(g_file_handle,value);
+	}
+	else
+	{
+		while(1)
+		{
+			Read(g_file_handle,single_byte);
+			if(single_byte=='\r') continue; //Handles windows files
+			if(single_byte=='\n' || single_byte==' ') break;
+			value = value*10 + (single_byte-'0');
+		}
+	}
+	return value;
+}
+
+bool turn_to(Pos pos, Waypoint waypoint, Motor &motor)
+{
+	float wpx = waypoint.x;
+	float wpy = waypoint.y;
+	float rel_ang = unwrap(atan2((wpy-pos.y),(wpx-pos.x)) - pos.ang);
+	float rel_dist = sqrt((wpy-pos.y)*(wpy-pos.y) + (wpx-pos.x)*(wpx-pos.x));
+	float rate = sin(rel_ang)*RATE_SF;
+	float speed = 0; //motor.speed - abs(sin(rel_ang));
+	//if(speed<0) speed = 0;
+	if(abs(rate) < MIN_RATE) rate = (rate<0)? -MIN_RATE : MIN_RATE;
+	if(abs(rate) > MAX_RATE) rate = (rate<0)? -MAX_RATE : MAX_RATE;
+	motor.left = speed - rate;
+	motor.right = speed + rate;
+	motor.speed = speed;
+	motor.rate = rate;
+	motor.rel_ang = rel_ang;
+	motor.rel_dist = rel_dist;
+	return (abs(rel_ang)<MIN_TARGET_ANG);
+}
+
+bool steer_to(Pos pos, Waypoint waypoint, Motor &motor)
+{
+	float wpx = waypoint.x;
+	float wpy = waypoint.y;
+	float rel_ang= unwrap(atan2((wpy-pos.y),(wpx-pos.x)) - pos.ang);
+	float rel_dist = sqrt((wpy-pos.y)*(wpy-pos.y) + (wpx-pos.x)*(wpx-pos.x));
+	float speed = MAX_SPEED - abs(sin(rel_ang))*MAX_SPEED;
+	float rate = sin(rel_ang)*RATE_SF*(rel_dist>2*MIN_TARGET_DIST);
+	bool is_farther;
+	motor.left = speed - rate;
+	motor.right = speed + rate;
+	motor.speed = speed;
+	motor.rate = rate;
+	motor.rel_ang = rel_ang;
+	motor.rel_dist = rel_dist;
+	is_farther = rel_dist>g_last_rel_dist;
+	g_last_rel_dist = rel_dist;
+	return(rel_dist<MIN_TARGET_DIST || (rel_dist<3*MIN_TARGET_DIST && is_farther));
+}
+
+bool move_to(Pos pos, Waypoint waypoint, Motor &motor)
+{
+	float wpx = waypoint.x;
+	float wpy = waypoint.y;
+	float rel_ang= unwrap(atan2((wpy-pos.y),(wpx-pos.x)) - pos.ang);
+	float rel_dist = sqrt((wpy-pos.y)*(wpy-pos.y) + (wpx-pos.x)*(wpx-pos.x));
+	float speed = MAX_SPEED;
+	bool is_farther;
+	motor.left = speed;
+	motor.right = speed;
+	motor.speed = speed;
+	motor.rate = 0;
+	motor.rel_ang = rel_ang;
+	motor.rel_dist = rel_dist;
+	is_farther = rel_dist>g_last_rel_dist;
+	g_last_rel_dist = rel_dist;
+	return(rel_dist<MIN_TARGET_DIST || (rel_dist<3*MIN_TARGET_DIST && is_farther));
+}
+
+
+//Verify that next waypoint is located aproximately in front of the robot and at least farther than MIN_TARGET_DIST
+float angle_to_waypoint(Pos pos, Waypoint waypoint, Motor &motor)
+{
+	float wpx = waypoint.x;
+	float wpy = waypoint.y;
+	float last_wpx = g_last_waypoint.x;
+	float last_wpy = g_last_waypoint.y;
+	float rel_ang_wpnt = unwrap(atan2((wpy-last_wpy),(wpx-last_wpx)) - pos.ang);
+	float rel_ang= unwrap(atan2((wpy-pos.y),(wpx-pos.x)) - pos.ang);
+	float rel_dist = sqrt((wpy-pos.y)*(wpy-pos.y) + (wpx-pos.x)*(wpx-pos.x));
+	if(abs(unwrap(rel_ang-rel_ang_wpnt))>PI/2.0 || rel_dist<MIN_TARGET_DIST)
+		return -1.0; //Returns a negative value if the waypoint is already past
+	return(abs(rel_ang));
+}
+
+//Main program
+task main()
+{
+	//User interface
+	ReadButtonType rbArgs;
+	char button_flag = true;
+	//Timing information
+	int last_time;
+	int new_time;
+	int period;
+	int max_period = 0;
+	int min_period = 10000;
+	int sum_period = 0;
+	int cnt = 1;
+	int aux_int;
+	//Positioning and control information
+	Waypoint waypoint;
+	unsigned char waypoint_number;
+	Motor motor;
+	Pos pos;
+	float rel_ang=0;
+	int waypoint_idx = 0;
+	char state = LOADING_HEADER;
+	char marker_status = DOWN;
+
+	//Initialization
+	//Resets sensor and waits for hardware to apply the command
+	open_for_read();
+	SetSensorLowspeed(XG1300L_PORT);
+	Wait(500);
+	XglReset();
+	waypoint.x = 0;
+	waypoint.y = 0;
+	TextOut(0,LCD_LINE1,"Starting System ....", false);
+	Wait(500);
+	ClearScreen();
+ 	last_time = CurrentTick();
+
+	//Main loop
+	while(state!=QUITTING)
+	{
+		//Computed elapsed time
+ 		new_time = CurrentTick();
+		period = new_time-last_time;
+		if(period>max_period) max_period = period;
+		if(cnt>2 && period<min_period) min_period = period;
+		if(0 && !(cnt%100))
+		{
+			max_period = 0;
+			min_period = 10000;
+		}
+		last_time = new_time;
+
+		//Call position estimation function
+		estimate_position(pos);
+		switch(state)
+		{
+			case LOADING_HEADER:
+				marker_status = GOING_UP;
+				waypoint_number = read_number();
+				waypoint_idx = 0;
+			case LOADING_WAYPOINTS:
+				g_last_waypoint.x = waypoint.x;
+				g_last_waypoint.y = waypoint.y;
+				do
+				{
+					waypoint.x = read_number()*SCALE_FACTOR;
+					waypoint.y = read_number()*SCALE_FACTOR;
+					rel_ang = angle_to_waypoint(pos,waypoint,motor);
+					waypoint_idx++;
+				}while(rel_ang<0 && waypoint_idx<2);
+				state = (waypoint_idx>1 && rel_ang<MIN_TARGET_ANG*2.0) ? MOVING : TURNING;
+				g_last_rel_dist = 1000; //Set an huge distance
+				break;
+			case TURNING:
+				if(turn_to(pos,waypoint,motor))
+				{
+					if(waypoint_idx>1)
+					{
+						state = MOVING;
+						if(marker_status!=DOWN)
+							marker_status = GOING_DOWN;
+					}
+					else
+						state = STEERING;
+				}
+				break;
+			case MOVING:
+				if(move_to(pos,waypoint,motor))
+					state =(waypoint_idx==waypoint_number) ? LOADING_HEADER : LOADING_WAYPOINTS;
+				break;
+			case STEERING:
+				if(steer_to(pos,waypoint,motor))
+				{
+					if(waypoint_number==1) 
+					{
+						motor.right = 0;
+						motor.left = 0;
+						state = QUITTING;
+					}
+					else
+						state = LOADING_WAYPOINTS;
+				}
+				break;
+		}
+
+		if(button_flag)
+		{
+			//Send motor command
+			OnFwdReg(RIGHT_MOTOR, motor.right, OUT_REGMODE_SPEED);
+			OnFwdReg(LEFT_MOTOR, motor.left, OUT_REGMODE_SPEED);
+		}
+		else
+		{
+			OnFwdReg(RIGHT_MOTOR, 0, OUT_REGMODE_SPEED);
+			OnFwdReg(LEFT_MOTOR, 0, OUT_REGMODE_SPEED);
+		}
+
+		switch(marker_status)
+		{
+			case GOING_DOWN:
+				OnFwdReg(MARKER_MOTOR, MARKER_POWER, OUT_REGMODE_SPEED);
+				if(MotorRotationCount(MARKER_MOTOR)>0)
+					marker_status = DOWN;
+				break;
+			case GOING_UP:
+				OnFwdReg(MARKER_MOTOR, -MARKER_POWER, OUT_REGMODE_SPEED);
+				if(MotorRotationCount(MARKER_MOTOR)<-MARKER_ANGLE)
+					marker_status = UP;
+				break;
+			case DOWN:
+			case UP:
+				OnFwdReg(MARKER_MOTOR, 0, OUT_REGMODE_SPEED);
+		}
+		
+		//Display important information about the robot
+		ClearScreen();
+		//Waypoints
+		TextOut(0,LCD_LINE1,"WP", false);
+    NumOut(COL1,LCD_LINE1,waypoint.x);
+    NumOut(COL2,LCD_LINE1,waypoint.y);
+    NumOut(COL3,LCD_LINE1,waypoint_idx);
+    NumOut(COL4,LCD_LINE1,waypoint_number);
+		//Pose
+		TextOut(0,LCD_LINE2,"XY", false);
+		aux_int = pos.x;
+    NumOut(COL1,LCD_LINE2,aux_int);
+		aux_int = pos.y;
+    NumOut(COL2,LCD_LINE2,aux_int);
+		aux_int = pos.ang*180.0/PI;
+    NumOut(COL3,LCD_LINE2,aux_int);
+		//Speed and rate
+		TextOut(0,LCD_LINE3,"WV", false);
+		aux_int = (g_last_ang - pos.ang)/period*1000*180/PI;
+    NumOut(COL1,LCD_LINE3,aux_int);
+		aux_int = pos.dist/period*1000;
+    NumOut(COL3,LCD_LINE3,aux_int);
+		//Relative angle and distance to target
+		TextOut(0,LCD_LINE4,"RE", false);
+		aux_int = motor.rel_ang*180.0/PI;
+    NumOut(COL1,LCD_LINE4,aux_int);
+		aux_int = motor.rel_dist;
+    NumOut(COL3,LCD_LINE4,aux_int);
+		//Commanded rate and speed
+		TextOut(0,LCD_LINE5,"WV", false);
+		aux_int = motor.rate;
+    NumOut(COL1,LCD_LINE5,aux_int);
+		aux_int = motor.speed;
+    NumOut(COL3,LCD_LINE5,aux_int);
+		//Left and right motor speeds
+		TextOut(0,LCD_LINE6,"LR", false);
+		aux_int = motor.right;
+    NumOut(COL1,LCD_LINE6,aux_int);
+		aux_int = motor.left;
+    NumOut(COL3,LCD_LINE6,aux_int);
+		//Timming
+		TextOut(0,LCD_LINE7,"TM", false);
+    NumOut(COL1,LCD_LINE7,period);
+    NumOut(COL2,LCD_LINE7,min_period);
+    NumOut(COL3,LCD_LINE7,max_period);
+
+		//Status
+		TextOut(0,LCD_LINE8,"ST", false);
+    NumOut(COL1,LCD_LINE8,period*cnt/1000);
+    NumOut(COL3,LCD_LINE8,state);
+
+		//Check if a button was pressed
+		rbArgs.Index = BTNCENTER;
+    SysReadButton(rbArgs);
+		if (rbArgs.Pressed)
+			button_flag = !button_flag;
+		cnt ++;
+	}
+	//Shutdown motors and close file
+	OnFwdReg(RIGHT_MOTOR, 0, OUT_REGMODE_SPEED);
+	OnFwdReg(LEFT_MOTOR, 0, OUT_REGMODE_SPEED);
+	CloseFile(g_file_handle);
+	while(1);
+}
