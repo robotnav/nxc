@@ -4,6 +4,8 @@
 * <lvojeda@gmail.com>
 *
 * Robot drawing system using the Lego NXT
+* This program must be used in convination with the file drawing.log
+* (which should be loaded in the NXT brick)
 *
 * This program is free software; you can redistribute it and/or
 * modify it under the terms of the GNU General Public License as
